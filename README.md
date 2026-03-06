@@ -10,7 +10,7 @@
 - **Git**
 
 ### Необходимые библиотеки
-numpy, scipy, matplotlib, pandas, control, psutil, но также зависимости прописаны в файле requirements.txt
+numpy, scipy, matplotlib, pandas, control, psutil, но также зависимости прописала в файле requirements.txt
 # Установить все зависимости:
 pip install -r requirements.txt
 # Запустить эксперименты
