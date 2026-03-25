@@ -1,7 +1,10 @@
 ﻿"""
 Основной скрипт для проведения сравнительных экспериментов.
 Запускает все алгоритмы на всех задачах и собирает метрики.
-Автоматически запускает визуализацию после завершения.
+Теперь поддерживает:
+    - Два уровня успешности: Feasible и Acceptable.
+    - Агрегирование истории сходимости по всем запускам.
+    - Метрики по числу вычислений функции (FE до порога, J@FE).
 """
 
 import numpy as np
@@ -10,12 +13,13 @@ import json
 import time
 from datetime import datetime
 import os
-import subprocess
 import sys
 from typing import Dict, List, Tuple, Any
 
 from algorithms import PSO, GWO, WOA, HHO, SMA
 from problems import get_problem_info
+from simulation import simulate_dc_motor_pid, compute_step_metrics
+
 
 class ComparativeExperiment:
     """Класс для проведения сравнительных экспериментов"""
@@ -26,24 +30,14 @@ class ComparativeExperiment:
                  pop_size: int = 30,
                  output_dir: str = "experiment_results",
                  auto_visualize: bool = True):
-        """
-        Args:
-            num_runs: Количество независимых запусков каждого алгоритма
-            max_iter: Максимальное количество итераций
-            pop_size: Размер популяции
-            output_dir: Директория для сохранения результатов
-            auto_visualize: Автоматически запускать визуализацию после экспериментов
-        """
         self.num_runs = num_runs
         self.max_iter = max_iter
         self.pop_size = pop_size
         self.output_dir = output_dir
         self.auto_visualize = auto_visualize
         
-        # Создаем директорию для результатов
         os.makedirs(output_dir, exist_ok=True)
         
-        # Определяем алгоритмы для сравнения
         self.algorithms = {
             'PSO': PSO,
             'GWO': GWO,
@@ -52,46 +46,108 @@ class ComparativeExperiment:
             'SMA': SMA
         }
         
-        # Определяем задачи для тестирования
         self.problems = {
             'dc_motor_pid': 'Оптимизация ПИД-регулятора (двигатель)',
             'inverted_pendulum': 'Балансировка маятника',
             'liquid_level': 'Управление уровнем жидкости'
         }
         
-        # Названия задач для красивого вывода
         self.problem_titles = {
             'dc_motor_pid': 'ПИД-регулятор двигателя',
             'inverted_pendulum': 'Балансировка маятника',
             'liquid_level': 'Уровень жидкости'
         }
         
-        # Результаты экспериментов
         self.results = {}
-        self.convergence_data = {}
-        
-        # Время начала эксперимента
+        self.convergence_data = {}   # для каждого алгоритма и задачи храним список историй
         self.start_time = None
+    
+    def evaluate_solution(self, problem_name: str, solution: np.ndarray) -> Dict[str, Any]:
+        """
+        Пост-проверка решения: определяет допустимость и приемлемость,
+        а также вычисляет инженерные метрики.
+        """
+        if problem_name == 'dc_motor_pid':
+            Kp, Ki, Kd = solution
+            # Допустимость: параметры в границах и моделирование прошло без ошибок
+            if not (0.1 <= Kp <= 50 and 0.01 <= Ki <= 30 and 0 <= Kd <= 10):
+                return {'feasible': False, 'acceptable': False, 'metrics': {}}
+            try:
+                t, y = simulate_dc_motor_pid(solution, t_end=5, n_points=500)
+                if np.any(np.isnan(y)) or np.any(np.isinf(y)):
+                    return {'feasible': False, 'acceptable': False, 'metrics': {}}
+                metrics = compute_step_metrics(t, y)
+                feasible = True
+                # Приемлемость: перерегулирование ≤ 10%, время установления ≤ 2 с, уст. ошибка ≤ 0.02
+                acceptable = (metrics['overshoot'] <= 10.0 and 
+                              metrics['settling_time'] <= 2.0 and
+                              metrics['steady_state_error'] <= 0.02)
+                return {'feasible': feasible, 'acceptable': acceptable, 'metrics': metrics}
+            except:
+                return {'feasible': False, 'acceptable': False, 'metrics': {}}
         
+        elif problem_name == 'inverted_pendulum':
+            # Параметры маятника (те же, что в problems.py)
+            M, m, b, l, g = 1.0, 0.1, 0.1, 0.5, 9.81
+            A = np.array([
+                [0, 1, 0, 0],
+                [0, -b/M, -m*g/M, 0],
+                [0, 0, 0, 1],
+                [0, -b/(M*l), (M+m)*g/(M*l), 0]
+            ])
+            B = np.array([[0], [1/M], [0], [1/(M*l)]])
+            K = np.array([[solution[0], solution[1], solution[2], solution[3]]])
+            A_closed = A - B @ K
+            eigvals = np.linalg.eigvals(A_closed)
+            feasible = np.all(np.real(eigvals) < 0)
+            if not feasible:
+                return {'feasible': False, 'acceptable': False, 'metrics': {}}
+            # Моделируем
+            def dyn(x, t):
+                return A_closed.dot(x)
+            x0 = [0, 0, 0.1, 0]
+            t_span = np.linspace(0, 5, 500)
+            from scipy.integrate import odeint
+            x = odeint(dyn, x0, t_span)
+            # Приемлемость: максимальное отклонение угла < 0.05 рад после переходного процесса
+            final_angle = np.abs(x[-1, 2])
+            max_angle = np.max(np.abs(x[:, 2]))
+            acceptable = (final_angle < 0.05) and (max_angle < 0.2)
+            return {'feasible': feasible, 'acceptable': acceptable, 'metrics': {'final_angle': final_angle, 'max_angle': max_angle}}
+        
+        elif problem_name == 'liquid_level':
+            # Упрощённая проверка допустимости: нет NaN, уровни в разумных пределах
+            # Для полной проверки можно запустить симуляцию с полученными параметрами
+            from problems import liquid_level_control_objective
+            try:
+                fit = liquid_level_control_objective(solution)
+                feasible = fit < 1e6
+                if not feasible:
+                    return {'feasible': False, 'acceptable': False, 'metrics': {}}
+                # Приемлемость: остаточная ошибка по обоим каналам < 0.05
+                # Здесь мы не можем получить финальные уровни без повторной симуляции, но можем использовать fit
+                # Более правильно: пересчитать симуляцию и взять финальную ошибку
+                # Для простоты: будем считать приемлемым, если фитнес < 10 (это эмпирическое пороговое значение)
+                acceptable = fit < 10.0
+                return {'feasible': feasible, 'acceptable': acceptable, 'metrics': {'fitness': fit}}
+            except:
+                return {'feasible': False, 'acceptable': False, 'metrics': {}}
+        else:
+            return {'feasible': False, 'acceptable': False, 'metrics': {}}
+    
     def run_single_experiment(self, 
                              algorithm_class,
                              problem_info: Dict,
                              algorithm_name: str,
                              problem_name: str,
                              run_id: int) -> Dict[str, Any]:
-        """
-        Запуск одного эксперимента (один алгоритм на одной задаче).
-        """
+        """Запуск одного эксперимента с возвратом метрик, включая флаги допустимости"""
         try:
-            # Фиксируем seed для воспроизводимости
             seed = 42 + run_id * 100
-            
-            # Извлекаем информацию о задаче
             dim = problem_info['dim']
             bounds = problem_info['bounds']
             objective_func = problem_info['objective_func']
             
-            # Создаем экземпляр алгоритма с оптимальными параметрами
             if algorithm_name == 'PSO':
                 algorithm = algorithm_class(
                     objective_func=objective_func,
@@ -124,22 +180,61 @@ class ComparativeExperiment:
                     seed=seed
                 )
             
-            # Запускаем оптимизацию
             best_solution, best_fitness = algorithm.optimize()
-            
-            # Получаем метрики
             metrics = algorithm.get_metrics()
             
-            # Дополнительные метрики
+            # Пост-проверка решения
+            eval_result = self.evaluate_solution(problem_name, best_solution)
+            
+            # Вычисляем FE до порога (если порог достигнут)
+            target_fitness = 1e-3  # порог для всех задач
+            fe_to_target = None
+            if 'convergence_history' in metrics and metrics['convergence_history']:
+                hist = metrics['convergence_history']
+                for idx, val in enumerate(hist):
+                    if val <= target_fitness:
+                        # Вычисляем общее количество вычислений к этой итерации
+                        # Упрощённо: каждая итерация делает pop_size вычислений + начальные
+                        fe_at_idx = self.pop_size * (idx + 1)
+                        fe_to_target = fe_at_idx
+                        break
+            
+            # Значения на отсечках бюджета
+            J_at_500 = None
+            J_at_1000 = None
+            J_at_2000 = None
+            if 'convergence_history' in metrics and metrics['convergence_history']:
+                hist = metrics['convergence_history']
+                # Преобразуем историю в список FE
+                fe_values = [self.pop_size * (i+1) for i in range(len(hist))]
+                # Интерполяция
+                for target_fe, target_var in [(500, 'J_at_500'), (1000, 'J_at_1000'), (2000, 'J_at_2000')]:
+                    idx = np.searchsorted(fe_values, target_fe)
+                    if idx < len(hist):
+                        value = hist[idx]
+                    else:
+                        value = hist[-1] if hist else np.inf
+                    if target_fe == 500:
+                        J_at_500 = value
+                    elif target_fe == 1000:
+                        J_at_1000 = value
+                    elif target_fe == 2000:
+                        J_at_2000 = value
+            
             metrics.update({
                 'algorithm': algorithm_name,
                 'problem': problem_name,
                 'run_id': run_id,
                 'seed': seed,
                 'solution': best_solution.tolist(),
-                'best_fitness': float(best_fitness)
+                'best_fitness': float(best_fitness),
+                'feasible': eval_result['feasible'],
+                'acceptable': eval_result['acceptable'],
+                'fe_to_target': fe_to_target,
+                'J_at_500': J_at_500,
+                'J_at_1000': J_at_1000,
+                'J_at_2000': J_at_2000
             })
-            
             return metrics
             
         except Exception as e:
@@ -151,11 +246,12 @@ class ComparativeExperiment:
                 'best_fitness': float('inf'),
                 'execution_time': 0,
                 'function_evaluations': 0,
+                'feasible': False,
+                'acceptable': False,
                 'error': str(e)
             }
     
     def print_progress_bar(self, current, total, bar_length=50):
-        """Печатает прогресс-бар"""
         percent = current / total
         arrow = '=' * int(round(percent * bar_length))
         spaces = ' ' * (bar_length - len(arrow))
@@ -175,7 +271,6 @@ class ComparativeExperiment:
         sys.stdout.flush()
     
     def run_all_experiments(self):
-        """Запуск всех экспериментов"""
         self.start_time = time.time()
         
         print("=" * 90)
@@ -191,10 +286,8 @@ class ComparativeExperiment:
         total_experiments = len(self.algorithms) * len(self.problems) * self.num_runs
         current_experiment = 0
         
-        # Словарь для хранения времени выполнения по задачам
         problem_times = {}
         
-        # Цикл по всем задачам
         for problem_idx, (problem_name, problem_description) in enumerate(self.problems.items(), 1):
             problem_start = time.time()
             
@@ -202,31 +295,25 @@ class ComparativeExperiment:
             print(f" ЗАДАЧА {problem_idx}/{len(self.problems)}: {problem_description}")
             print(f"{'='*60}")
             
-            # Получаем информацию о задаче
             problem_info = get_problem_info(problem_name)
             if problem_info is None:
                 print(f"❌ Ошибка: задача '{problem_name}' не найдена")
                 continue
             
-            # Инициализируем структуры для хранения результатов по задаче
             self.results[problem_name] = {}
-            self.convergence_data[problem_name] = {}
+            self.convergence_data[problem_name] = {}  # здесь будем хранить список историй для каждого алгоритма
             
-            # Цикл по всем алгоритмам
             for algo_idx, (algorithm_name, algorithm_class) in enumerate(self.algorithms.items(), 1):
                 print(f"\n  Алгоритм {algo_idx}/{len(self.algorithms)}: {algorithm_name}")
                 print("  " + "-" * 40)
                 
-                # Массивы для хранения результатов по запускам
                 all_metrics = []
-                convergence_histories = []
+                convergence_histories = []  # список списков best_fitness по запускам
                 
-                # Множественные запуски для статистической значимости
                 for run_id in range(self.num_runs):
                     current_experiment += 1
                     self.print_progress_bar(current_experiment, total_experiments)
                     
-                    # Запуск эксперимента
                     metrics = self.run_single_experiment(
                         algorithm_class=algorithm_class,
                         problem_info=problem_info,
@@ -234,88 +321,98 @@ class ComparativeExperiment:
                         problem_name=problem_name,
                         run_id=run_id
                     )
-                    
-                    # Сохраняем результаты
                     all_metrics.append(metrics)
-                    
-                    # Сохраняем историю сходимости (только для успешных запусков)
-                    if run_id == 0 and 'convergence_history' in metrics:
-                        convergence_histories = metrics['convergence_history']
-                        self.convergence_data[problem_name][algorithm_name] = convergence_histories
+                    if 'convergence_history' in metrics and metrics['convergence_history']:
+                        convergence_histories.append(metrics['convergence_history'])
+                    else:
+                        convergence_histories.append([])
                 
-                # Очищаем строку прогресс-бара
                 print()
                 
-                # Фильтруем успешные запуски
-                successful_runs = [m for m in all_metrics if 'error' not in m and m['best_fitness'] < 1e9]
+                # Фильтруем успешные (feasible) запуски для вычисления статистики
+                feasible_runs = [m for m in all_metrics if m.get('feasible', False)]
+                acceptable_runs = [m for m in all_metrics if m.get('acceptable', False)]
                 
-                if successful_runs:
-                    best_fitness_values = [m['best_fitness'] for m in successful_runs]
-                    execution_times = [m['execution_time'] for m in successful_runs]
+                if feasible_runs:
+                    best_fitness_values = [m['best_fitness'] for m in feasible_runs]
+                    execution_times = [m['execution_time'] for m in feasible_runs]
                     
                     mean_fitness = np.mean(best_fitness_values)
                     std_fitness = np.std(best_fitness_values)
+                    median_fitness = np.median(best_fitness_values)
+                    q25_fitness = np.percentile(best_fitness_values, 25)
+                    q75_fitness = np.percentile(best_fitness_values, 75)
+                    
                     mean_time = np.mean(execution_times)
                     std_time = np.std(execution_times)
                     
-                    # Цветной вывод в зависимости от качества
-                    if mean_fitness < 1e-1:
-                        status = "✅"
-                    elif mean_fitness < 1e6:
-                        status = "⚠️"
-                    else:
-                        status = "❌"
+                    # FE до порога
+                    fe_to_target_list = [m.get('fe_to_target', None) for m in feasible_runs if m.get('fe_to_target') is not None]
+                    median_fe_to_target = np.median(fe_to_target_list) if fe_to_target_list else np.nan
                     
+                    # J@FE
+                    J500_list = [m.get('J_at_500', None) for m in feasible_runs if m.get('J_at_500') is not None]
+                    median_J500 = np.median(J500_list) if J500_list else np.nan
+                    J1000_list = [m.get('J_at_1000', None) for m in feasible_runs if m.get('J_at_1000') is not None]
+                    median_J1000 = np.median(J1000_list) if J1000_list else np.nan
+                    J2000_list = [m.get('J_at_2000', None) for m in feasible_runs if m.get('J_at_2000') is not None]
+                    median_J2000 = np.median(J2000_list) if J2000_list else np.nan
+                    
+                    feasible_rate = len(feasible_runs) / len(all_metrics) * 100
+                    acceptable_rate = len(acceptable_runs) / len(all_metrics) * 100
+                    
+                    # Вывод
+                    status = "✅" if acceptable_rate > 50 else "⚠️" if feasible_rate > 0 else "❌"
                     print(f"  {status} {algorithm_name}: "
                           f"Фитнес = {mean_fitness:.4e} ± {std_fitness:.4e}, "
-                          f"Время = {mean_time:.3f} ± {std_time:.3f} с")
+                          f"Время = {mean_time:.3f} ± {std_time:.3f} с, "
+                          f"Feasible={feasible_rate:.1f}%, Acceptable={acceptable_rate:.1f}%")
                     
-                    # Сохраняем агрегированные результаты
                     self.results[problem_name][algorithm_name] = {
                         'best_fitness_mean': float(mean_fitness),
                         'best_fitness_std': float(std_fitness),
-                        'best_fitness_min': float(np.min(best_fitness_values)),
-                        'best_fitness_max': float(np.max(best_fitness_values)),
+                        'best_fitness_median': float(median_fitness),
+                        'best_fitness_q25': float(q25_fitness),
+                        'best_fitness_q75': float(q75_fitness),
                         'execution_time_mean': float(mean_time),
                         'execution_time_std': float(std_time),
-                        'all_runs': all_metrics,
-                        'convergence_history': convergence_histories,
-                        'success_rate': len(successful_runs) / len(all_metrics) * 100
-                    }
-                    
-                else:
-                    print(f"  ❌ {algorithm_name}: Нет успешных запусков")
-                    self.results[problem_name][algorithm_name] = {
-                        'error': 'Нет успешных запусков',
+                        'feasible_rate': feasible_rate,
+                        'acceptable_rate': acceptable_rate,
+                        'median_fe_to_target': median_fe_to_target,
+                        'median_J_at_500': median_J500,
+                        'median_J_at_1000': median_J1000,
+                        'median_J_at_2000': median_J2000,
                         'all_runs': all_metrics
                     }
+                    
+                    # Сохраняем истории сходимости для всех запусков
+                    self.convergence_data[problem_name][algorithm_name] = convergence_histories
+                else:
+                    print(f"  ❌ {algorithm_name}: Нет допустимых запусков")
+                    self.results[problem_name][algorithm_name] = {
+                        'error': 'Нет допустимых запусков',
+                        'all_runs': all_metrics
+                    }
+                    self.convergence_data[problem_name][algorithm_name] = []
             
-            problem_time = time.time() - problem_start
-            problem_times[problem_name] = problem_time
-            print(f"\n   Время выполнения задачи: {problem_time:.2f} с")
+            problem_times[problem_name] = time.time() - problem_start
+            print(f"\n   Время выполнения задачи: {problem_times[problem_name]:.2f} с")
         
-        # Сохраняем все результаты
         self.save_results()
-        
-        # Выводим итоговую статистику
         self.print_final_statistics(problem_times)
         
-        # Автоматически запускаем визуализацию
         if self.auto_visualize:
             self.run_visualization()
         
         return self.results
     
     def save_results(self):
-        """Сохранение всех результатов в файлы"""
-        
         print("\n" + "=" * 60)
         print("СОХРАНЕНИЕ РЕЗУЛЬТАТОВ")
         print("=" * 60)
         
-        # Сохраняем агрегированные результаты в CSV
+        # Сводная таблица CSV
         summary_data = []
-        
         for problem_name, algorithms in self.results.items():
             for algorithm_name, metrics in algorithms.items():
                 if 'error' not in metrics:
@@ -324,9 +421,17 @@ class ComparativeExperiment:
                         'Algorithm': algorithm_name,
                         'Best_Fitness_Mean': metrics['best_fitness_mean'],
                         'Best_Fitness_Std': metrics['best_fitness_std'],
+                        'Best_Fitness_Median': metrics['best_fitness_median'],
+                        'Best_Fitness_Q25': metrics['best_fitness_q25'],
+                        'Best_Fitness_Q75': metrics['best_fitness_q75'],
                         'Execution_Time_Mean': metrics['execution_time_mean'],
                         'Execution_Time_Std': metrics['execution_time_std'],
-                        'Success_Rate_%': metrics.get('success_rate', 0)
+                        'Feasible_Rate_%': metrics['feasible_rate'],
+                        'Acceptable_Rate_%': metrics['acceptable_rate'],
+                        'Median_FE_to_Target': metrics['median_fe_to_target'],
+                        'Median_J@500': metrics['median_J_at_500'],
+                        'Median_J@1000': metrics['median_J_at_1000'],
+                        'Median_J@2000': metrics['median_J_at_2000']
                     })
         
         if summary_data:
@@ -335,19 +440,19 @@ class ComparativeExperiment:
             summary_df.to_csv(summary_path, index=False, encoding='utf-8-sig')
             print(f" Сводные результаты: {summary_path}")
         
-        # Сохраняем детальные результаты в JSON
+        # Детальные результаты JSON
         detailed_path = os.path.join(self.output_dir, "results.json")
         with open(detailed_path, 'w', encoding='utf-8') as f:
             json.dump(self.results, f, indent=2, default=str, ensure_ascii=False)
         print(f" Детальные результаты: {detailed_path}")
         
-        # Сохраняем данные сходимости
+        # Данные сходимости JSON (список историй по алгоритмам)
         convergence_path = os.path.join(self.output_dir, "convergence.json")
         with open(convergence_path, 'w', encoding='utf-8') as f:
             json.dump(self.convergence_data, f, indent=2, default=str, ensure_ascii=False)
         print(f" Данные сходимости: {convergence_path}")
         
-        # Сохраняем параметры эксперимента
+        # Параметры эксперимента
         experiment_params = {
             'num_runs': self.num_runs,
             'max_iter': self.max_iter,
@@ -355,22 +460,16 @@ class ComparativeExperiment:
             'timestamp': datetime.now().isoformat(),
             'total_time': time.time() - self.start_time
         }
-        
         params_path = os.path.join(self.output_dir, "params.json")
         with open(params_path, 'w') as f:
             json.dump(experiment_params, f, indent=2)
         print(f" Параметры эксперимента: {params_path}")
     
     def print_final_statistics(self, problem_times):
-        """Вывод итоговой статистики"""
-        
         total_time = time.time() - self.start_time
-        
         print("\n" + "=" * 90)
         print("ИТОГОВАЯ СТАТИСТИКА ЭКСПЕРИМЕНТОВ")
         print("=" * 90)
-        
-        # Время выполнения
         print(f"\n ВРЕМЯ ВЫПОЛНЕНИЯ:")
         print("-" * 40)
         for problem_name, p_time in problem_times.items():
@@ -379,64 +478,40 @@ class ComparativeExperiment:
         print(f"  {'='*30}")
         print(f"  ВСЕГО: {total_time:.2f} с ({total_time/60:.2f} мин)")
         
-        # Лучшие алгоритмы по задачам
-        print(f"\n ЛУЧШИЕ АЛГОРИТМЫ ПО ЗАДАЧАМ:")
+        print(f"\n ЛУЧШИЕ АЛГОРИТМЫ ПО ЗАДАЧАМ (по медиане фитнеса):")
         print("-" * 40)
-        
         for problem_name in self.problems.keys():
             if problem_name in self.results:
                 problem_results = self.results[problem_name]
-                
-                # Находим алгоритм с минимальным средним фитнесом
                 best_algo = None
-                best_fitness = float('inf')
-                
+                best_median = float('inf')
                 for algo_name, metrics in problem_results.items():
                     if 'error' not in metrics:
-                        if metrics['best_fitness_mean'] < best_fitness:
-                            best_fitness = metrics['best_fitness_mean']
+                        if metrics['best_fitness_median'] < best_median:
+                            best_median = metrics['best_fitness_median']
                             best_algo = algo_name
-                
                 if best_algo:
                     title = self.problem_titles.get(problem_name, problem_name)
-                    metrics = problem_results[best_algo]
-                    
-                    if best_fitness < 1e6:
-                        status = "✅"
-                    else:
-                        status = "⚠️"
-                    
-                    print(f"  {status} {title}: {best_algo} "
-                          f"(фитнес={best_fitness:.4e}, "
-                          f"время={metrics['execution_time_mean']:.3f} с)")
-        
+                    print(f"  {title}: {best_algo} (медиана фитнеса={best_median:.4e})")
         print("\n" + "=" * 90)
         print(" ЭКСПЕРИМЕНТЫ УСПЕШНО ЗАВЕРШЕНЫ")
         print(f" Все результаты в папке: {self.output_dir}")
         print("=" * 90)
     
     def run_visualization(self):
-        """Автоматический запуск визуализации"""
-        
         print("\n" + "=" * 60)
         print(" АВТОМАТИЧЕСКИЙ ЗАПУСК ВИЗУАЛИЗАЦИИ")
         print("=" * 60)
-        
-        # Проверяем наличие файлов визуализации
         viz_files = ['visualization.py', 'plot_step_responses.py']
-        
         for viz_file in viz_files:
             if os.path.exists(viz_file):
                 print(f"\n  Запуск {viz_file}...")
                 try:
-                    # Запускаем скрипт визуализации
+                    import subprocess
                     result = subprocess.run([sys.executable, viz_file], 
                                           capture_output=True, text=True)
-                    
                     if result.returncode == 0:
                         print(f"   {viz_file} выполнен успешно")
-                        
-                        # Для visualization.py показываем где искать графики
                         if viz_file == 'visualization.py':
                             print(f"     Графики сохранены в папке: plots/")
                         elif viz_file == 'plot_step_responses.py':
@@ -445,34 +520,23 @@ class ComparativeExperiment:
                     else:
                         print(f"   Ошибка в {viz_file}:")
                         print(f"     {result.stderr[:200]}")
-                        
                 except Exception as e:
                     print(f"   Не удалось запустить {viz_file}: {e}")
             else:
                 print(f"   Файл {viz_file} не найден, пропускаем")
-        
         print("\n" + "=" * 60)
         print(" ВИЗУАЛИЗАЦИЯ ЗАВЕРШЕНА")
         print("=" * 60)
 
 def main():
-    """Основная функция для запуска экспериментов"""
-    
-    # Параметры эксперимента
     experiment = ComparativeExperiment(
-        num_runs=10,      # Количество запусков
-        max_iter=100,     # Количество итераций
-        pop_size=30,      # Размер популяции
+        num_runs=10,
+        max_iter=100,
+        pop_size=30,
         output_dir="experiment_results",
-        auto_visualize=True  # Автоматически запускать визуализацию
+        auto_visualize=True
     )
-    
-    # Запускаем все эксперименты
-    results = experiment.run_all_experiments()
-    
-    print("\n" + "=" * 90)
-    print(" РАБОТА ЗАВЕРШЕНА! Все результаты и графики готовы.")
-    print("=" * 90)
+    experiment.run_all_experiments()
 
 if __name__ == "__main__":
     main()

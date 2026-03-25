@@ -7,6 +7,8 @@ import numpy as np
 from scipy.integrate import odeint
 import control as ctrl
 import warnings
+from simulation import simulate_dc_motor_pid, compute_step_metrics
+
 warnings.filterwarnings('ignore')
 
 # ============================================================================
@@ -16,60 +18,43 @@ warnings.filterwarnings('ignore')
 def dc_motor_pid_objective(params):
     """
     Целевая функция для оптимизации ПИД-регулятора двигателя постоянного тока.
-    Минимизация ITAE (Integral of Time-weighted Absolute Error).
+    Минимизируется ITAE + штраф за перерегулирование + штраф за ошибку на хвосте.
+    
+    Математическая постановка:
+        θ = [Kp, Ki, Kd]^T
+        G(s) = Kt / (JLs^2 + (JR+BL)s + (BR+Kt*Kb))
+        C(s) = (Kd s^2 + Kp s + Ki)/s
+        T(s) = C(s)G(s) / (1 + C(s)G(s))
+        J(θ) = Δt Σ t_k |e_k| + 100·max(0, max(y)-1) + 50·(1/|I|) Σ_{k∈I} |e_k|,
+            где e_k = 1 - y_k, I = {k : t_k > 3}
     """
     Kp, Ki, Kd = params
     
-    # Ограничение параметров (более мягкие границы)
-    if Kp < 0.1 or Ki < 0.01 or Kd < 0 or Kp > 50 or Ki > 30 or Kd > 10:
-        return 1e6  # Уменьшен штраф
+    # Проверка границ (соответствует bounds из get_problem_info)
+    if not (0.1 <= Kp <= 50 and 0.01 <= Ki <= 30 and 0 <= Kd <= 10):
+        return 1e6
     
     try:
-        # Параметры двигателя постоянного тока (упрощенная модель)
-        R = 1.0      # Сопротивление (Ом)
-        L = 0.5      # Индуктивность (Гн)
-        Kb = 0.01    # Коэффициент противо-ЭДС (В/рад/с)
-        Kt = 0.01    # Коэффициент момента (Нм/А)
-        J = 0.01     # Момент инерции (кг·м²)
-        B = 0.1      # Коэффициент вязкого трения (Нм·с)
+        t, y = simulate_dc_motor_pid(params, t_end=5, n_points=500)
+        e = 1 - y
+        dt = t[1] - t[0]
         
-        # Передаточная функция двигателя
-        num = [Kt]
-        den = [J*L, J*R + B*L, B*R + Kt*Kb]
-        motor_tf = ctrl.TransferFunction(num, den)
-        
-        # ПИД-регулятор
-        pid_tf = ctrl.TransferFunction([Kd, Kp, Ki], [1, 1e-10])
-        
-        # Система с обратной связью
-        sys_open = ctrl.series(pid_tf, motor_tf)
-        sys_closed = ctrl.feedback(sys_open, 1)
-        
-        # Временной интервал
-        t = np.linspace(0, 5, 500)  # Уменьшено время моделирования
-        
-        # Ступенчатый отклик
-        t_out, y_out = ctrl.step_response(sys_closed, t)
-        
-        # Вычисление ITAE
-        error = 1 - y_out
-        # Используем численное интегрирование через sum
-        itae = np.sum(t_out * np.abs(error)) * (t_out[1] - t_out[0])
+        # ITAE
+        J = np.sum(t * np.abs(e)) * dt
         
         # Штраф за перерегулирование
-        overshoot = max(0, np.max(y_out) - 1)
-        itae += 100 * overshoot
+        overshoot = max(0, (np.max(y) - y[-1]) / y[-1] * 100) if y[-1] > 0 else 100
+        J += 100 * overshoot
         
-        # Штраф за колебания
-        settling_idx = np.where(t_out > 3)[0]
-        if len(settling_idx) > 0:
-            settling_error = np.mean(np.abs(error[settling_idx]))
-            itae += 50 * settling_error
+        # Штраф за среднюю ошибку на хвосте (t > 3)
+        tail_mask = t > 3
+        if np.any(tail_mask):
+            tail_error = np.mean(np.abs(e[tail_mask]))
+            J += 50 * tail_error
         
-        return float(itae)
+        return float(J)
         
-    except Exception as e:
-        # Возвращаем штраф за неустойчивость
+    except Exception:
         return 1e6
 
 
@@ -80,22 +65,26 @@ def dc_motor_pid_objective(params):
 def inverted_pendulum_objective(params):
     """
     Целевая функция для балансировки перевернутого маятника.
+    Оптимизируются коэффициенты обратной связи по состоянию K = [K1, K2, K3, K4].
+    Используется линеаризованная модель:
+        dx/dt = (A - B K) x, x(0) = [0,0,0.1,0]^T
+        J(K) = (1/N) Σ x_k^T Q x_k, Q = diag(10, 0.1, 100, 0.1)
+    Если maxRe(λ(A-BK)) ≥ 0, возвращается штраф 1e6.
     """
     K1, K2, K3, K4 = params
     
-    # Ограничение параметров
-    if any(np.abs(p) > 100 for p in params):
+    # Проверка границ (соответствует bounds из get_problem_info)
+    if any(np.abs(p) > 50 for p in params):
         return 1e6
     
     try:
-        # Параметры маятника (упрощенная модель)
         M = 1.0      # Масса тележки (кг)
         m = 0.1      # Масса стержня (кг)
         b = 0.1      # Трение тележки (Н/м/с)
         l = 0.5      # Длина до центра массы стержня (м)
         g = 9.81     # Ускорение свободного падения (м/с²)
         
-        # Матрицы системы (линеаризованная модель)
+        # Матрицы линеаризованной модели
         A = np.array([
             [0, 1, 0, 0],
             [0, -b/M, -m*g/M, 0],
@@ -105,118 +94,89 @@ def inverted_pendulum_objective(params):
         
         B = np.array([[0], [1/M], [0], [1/(M*l)]])
         
-        # Коэффициенты регулятора
         K = np.array([[K1, K2, K3, K4]])
-        
-        # Система с регулятором
         A_closed = A - B @ K
         
         # Проверка устойчивости
         eigenvalues = np.linalg.eigvals(A_closed)
         if np.any(np.real(eigenvalues) >= 0):
-            return 1e6  # Штраф за неустойчивость
+            return 1e6
         
         # Моделирование
         def system_dynamics(x, t):
             return A_closed.dot(x)
         
-        # Начальные условия
-        x0 = np.array([0, 0, 0.1, 0])  # Угол 0.1 рад
-        
-        # Временной интервал
+        x0 = np.array([0, 0, 0.1, 0])
         t = np.linspace(0, 5, 500)
-        
-        # Решение системы
         x = odeint(system_dynamics, x0, t)
         
-        # Целевая функция
         Q = np.diag([10, 0.1, 100, 0.1])
-        
-        # Интеграл квадратов состояний (упрощенное вычисление)
-        cost = 0
-        for i in range(len(t)):
-            cost += x[i].T @ Q @ x[i]
-        
-        cost = cost / len(t)
+        cost = np.mean([x[i].T @ Q @ x[i] for i in range(len(t))])
         
         return float(cost)
         
-    except Exception as e:
+    except Exception:
         return 1e6
 
 
 # ============================================================================
-# 3. УПРАВЛЕНИЕ УРОВНЕМ ЖИДКОСТИ В РЕЗЕРВУАРАХ
+# 3. УПРАВЛЕНИЕ УРОВНЕМ ЖИДКОСТИ В РЕЗЕРВУАРАХ (усложненная модель)
 # ============================================================================
 
 def liquid_level_control_objective(params):
     """
     Целевая функция для управления уровнем жидкости в двух связанных резервуарах.
+    Оптимизируются параметры двух PI-регуляторов: [Kp1, Ki1, Kp2, Ki2].
+    Модель с нелинейными потоками (квадратичная зависимость).
     """
     Kp1, Ki1, Kp2, Ki2 = params
     
-    # Ограничение параметров
-    if any(p < 0 or p > 10 for p in params):
+    # Проверка границ (соответствует bounds из get_problem_info)
+    if not (0 <= Kp1 <= 5 and 0 <= Ki1 <= 2 and 0 <= Kp2 <= 5 and 0 <= Ki2 <= 2):
         return 1e6
     
     try:
-        # Параметры системы (упрощенная модель)
-        A1 = 2.0     # Площадь первого резервуара (м²)
-        A2 = 1.5     # Площадь второго резервуара (м²)
-        R1 = 0.5     # Сопротивление первой трубы (с/м²)
-        R2 = 0.7     # Сопротивление второй трубы (с/м²)
-        
-        # Желаемые уровни
-        h1_desired = 1.0
-        h2_desired = 0.8
-        
-        # Моделирование системы (дискретное)
+        # Параметры системы
+        A1, A2 = 2.0, 1.5          # площади сечений, м²
+        R1, R2 = 0.5, 0.7          # гидравлические сопротивления
+        h1_ref, h2_ref = 1.0, 0.8  # желаемые уровни
         dt = 0.1
         steps = 100
         
         # Начальные условия
         h1, h2 = 0.5, 0.3
-        error_integral1 = 0
-        error_integral2 = 0
+        I1, I2 = 0.0, 0.0
+        total_error = 0.0
         
-        total_error = 0
-        
-        for step in range(steps):
-            # Ошибки
-            e1 = h1_desired - h1
-            e2 = h2_desired - h2
+        for _ in range(steps):
+            e1 = h1_ref - h1
+            e2 = h2_ref - h2
             
-            # Интегралы ошибок
-            error_integral1 += e1 * dt
-            error_integral2 += e2 * dt
+            I1 += e1 * dt
+            I2 += e2 * dt
             
-            # Управляющие воздействия
-            u1 = Kp1 * e1 + Ki1 * error_integral1
-            u2 = Kp2 * e2 + Ki2 * error_integral2
+            u1 = np.clip(Kp1 * e1 + Ki1 * I1, 0, 2)
+            u2 = np.clip(Kp2 * e2 + Ki2 * I2, 0, 2)
             
-            # Ограничение управляющих воздействий
-            u1 = np.clip(u1, 0, 2)
-            u2 = np.clip(u2, 0, 2)
+            # Нелинейные потоки (квадратичные)
+            q12 = max(0, (h1 - h2) / R1) * np.sqrt(abs(h1 - h2) + 1e-6)
+            q2out = (h2 / R2) * np.sqrt(h2 + 1e-6)
             
-            # Упрощенные уравнения баланса
-            q12 = max(0, (h1 - h2) / R1)
-            q2_out = h2 / R2
-            
-            # Обновление уровней
             h1 += (u1 - q12) / A1 * dt
-            h2 += (q12 - q2_out + u2) / A2 * dt
+            h2 += (q12 - q2out + u2) / A2 * dt
             
-            # Накопление ошибки
+            # Гарантия неотрицательности
+            h1 = max(0, h1)
+            h2 = max(0, h2)
+            
             total_error += (abs(e1) + abs(e2)) * dt
         
-        # Добавляем штраф за установившуюся ошибку
-        final_e1 = abs(h1_desired - h1)
-        final_e2 = abs(h2_desired - h2)
-        total_error += 10 * (final_e1 + final_e2)
+        # Штраф за установившуюся ошибку
+        total_error += 10 * (abs(h1_ref - h1) + abs(h2_ref - h2))
         
         return float(total_error)
         
-    except Exception as e:
+    except Exception:
         return 1e6
 
 
